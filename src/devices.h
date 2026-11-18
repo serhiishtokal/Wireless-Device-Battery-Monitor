@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -18,10 +19,17 @@ struct DeviceStatus {
     bool connected  = true;    // false: receiver present, device switched off (hidden)
     int  millivolts = 0;       // battery voltage when reported (0 = unknown)
     int  graceSec   = 0;       // keep showing the last value this long if the device stops answering
+    std::uint64_t bluetoothAddress = 0;  // used to match Windows connection events
+    std::uint32_t hidProduct = 0;  // HID transport VID:PID, if known
+    bool usbHid = false;
 };
 
 // Queries every supported device. Blocking (can take a second or two); call from a worker thread.
+#ifdef _WIN32
+std::vector<DeviceStatus> PollAllDevices(std::vector<std::uint32_t>* removedUsbProducts = nullptr);
+#else
 std::vector<DeviceStatus> PollAllDevices();
+#endif
 
 // Prints every HID collection (for adding support for new devices).
 std::wstring DumpHidCollections();

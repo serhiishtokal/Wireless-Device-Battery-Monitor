@@ -10,11 +10,9 @@
 #include "report.h"
 #include "hid.h"
 
-namespace {
-
 // HKCU\Software\WirelessBattery\IgnoreDevices (REG_SZ): "VID:PID" pairs in hex, separated by spaces,
 // commas or semicolons (e.g. "28BD:0947, 046D:C547"). No driver ever opens those devices (issue #232).
-std::vector<std::pair<USHORT, USHORT>> IgnoredDevices() {
+std::vector<std::pair<USHORT, USHORT>> IgnoredHidDevices() {
     std::vector<std::pair<USHORT, USHORT>> out;
     wchar_t buf[1024];
     DWORD size = sizeof(buf);
@@ -35,12 +33,10 @@ std::vector<std::pair<USHORT, USHORT>> IgnoredDevices() {
     return out;
 }
 
-}  // namespace
-
-std::vector<DeviceStatus> PollAllDevices() {
+std::vector<DeviceStatus> PollAllDevices(std::vector<std::uint32_t>* removedUsbProducts) {
     PollContext ctx;
-    ctx.colls = EnumHid();
-    auto ignored = IgnoredDevices();
+    ctx.colls = EnumHid(removedUsbProducts);
+    auto ignored = IgnoredHidDevices();
     if (!ignored.empty())
         ctx.colls.erase(std::remove_if(ctx.colls.begin(), ctx.colls.end(), [&](const HidColl& c) {
                             return std::find(ignored.begin(), ignored.end(), std::make_pair(c.vid, c.pid)) != ignored.end();

@@ -11,5 +11,5 @@ g++ -std=c++17 -Os -municode -mwindows -static -s -ffunction-sections -fdata-sec
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -Wall -Wno-missing-field-initializers ^
     !SOURCES! ^
     build\app_res.o -o WirelessBattery.exe ^
-    -lhid -lsetupapi -lcfgmgr32 -lole32 -loleaut32 -lcomctl32 -lgdi32 -lruntimeobject -lws2_32 -lwinhttp || exit /b 1
+    -lhid -lsetupapi -lcfgmgr32 -lole32 -loleaut32 -lcomctl32 -lgdi32 -lruntimeobject -lws2_32 -lwinhttp -lbthprops || exit /b 1
 echo Built WirelessBattery.exe

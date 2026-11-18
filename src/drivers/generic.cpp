@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cwchar>
 #include <map>
 
 namespace {
@@ -107,6 +108,14 @@ std::wstring HidContainer(const std::wstring& path) { return ContainerOf(path); 
 
 }  // namespace
 
+std::uint64_t BluetoothAddressFromInstance(const wchar_t* instanceId) {
+    const wchar_t* hex = nullptr;
+    if (!wcsncmp(instanceId, L"BTHENUM\\DEV_", 12)) hex = instanceId + 12;
+    else if (!wcsncmp(instanceId, L"BTHLE\\DEV_", 10)) hex = instanceId + 10;
+    if (!hex || wcsspn(hex, L"0123456789ABCDEFabcdef") != 12 || (hex[12] && hex[12] != L'\\')) return 0;
+    return wcstoull(hex, nullptr, 16);
+}
+
 void PollGenericHid(PollContext& ctx) {
     // Drawing tablets and pen displays (any collection on the Digitizers page 0D) are never read:
     // polling one for a battery report flipped the Y axis of an XP-Pen Deco Fun S (issue #232).
@@ -118,8 +127,16 @@ void PollGenericHid(PollContext& ctx) {
         if (c.page() == 0x84 || c.page() == 0x85) continue;  // UPS / power supplies
         if (std::find(digitizers.begin(), digitizers.end(), std::make_pair(c.vid, c.pid)) != digitizers.end()) continue;
         if (!c.caps.NumberFeatureValueCaps && !c.caps.NumberInputValueCaps) continue;
-        // Same physical device already shown with Windows' Bluetooth level (its HID field can read 0).
-        if (!ctx.btContainers.empty() && ctx.btContainers.count(ContainerOf(c.path))) continue;
+        auto bluetooth = ctx.out.end();
+        if (!ctx.btContainers.empty()) {
+            auto container = ContainerOf(c.path);
+            if (ctx.btContainers.count(container)) {
+                const auto key = L"bt:" + container;
+                bluetooth = std::find_if(ctx.out.begin(), ctx.out.end(), [&](const auto& s) { return s.key == key; });
+                // Keep Windows' Bluetooth level when present. HID can fill in a missing reading.
+                if (bluetooth == ctx.out.end() || bluetooth->percent >= 0) continue;
+            }
+        }
         HANDLE h = CreateFileW(c.path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) continue;
         PHIDP_PREPARSED_DATA pp;
@@ -155,6 +172,11 @@ void PollGenericHid(PollContext& ctx) {
         HidD_FreePreparsedData(pp);
         CloseHandle(h);
         if (pct < 0) continue;
+        if (bluetooth != ctx.out.end()) {
+            bluetooth->percent = pct;
+            ctx.Claim(c.vid, c.pid);
+            continue;
+        }
         DeviceStatus s;
         s.name = HidProduct(c);
         if (s.name.empty()) s.name = L"Wireless device";
@@ -172,7 +194,8 @@ void PollBluetooth(PollContext& ctx) {
     if (di == INVALID_HANDLE_VALUE) return;
 
     struct Found { int pct; std::wstring name; bool connected; };
-    std::map<std::wstring, std::wstring> containerName;  // container id -> name of the main BT device node
+    struct DeviceNode { std::wstring name; std::uint64_t address; };
+    std::map<std::wstring, DeviceNode> containerDevice;
     std::map<std::wstring, UINT32> containerCod;         // container id -> class of device
     std::map<std::wstring, std::wstring> containerCat;   // container id -> device container category
     std::map<std::wstring, bool> containerConn;          // container id -> main BT device node connected
@@ -194,7 +217,7 @@ void PollBluetooth(PollContext& ctx) {
         std::wstring name = StrProp(di, &dd, DEVPKEY_Device_FriendlyName);
         if (name.empty()) name = StrProp(di, &dd, DEVPKEY_Device_DeviceDesc);
         if (!wcsncmp(inst, L"BTHENUM\\DEV_", 12) || !wcsncmp(inst, L"BTHLE\\DEV_", 10)) {
-            containerName[cid] = name;
+            containerDevice[cid] = { name, BluetoothAddressFromInstance(inst) };
             UINT32 cod = 0;
             if (SetupDiGetDevicePropertyW(di, &dd, &kClassOfDevice, &t, (PBYTE)&cod, sizeof(cod), nullptr, 0) && t == DEVPROP_TYPE_UINT32)
                 containerCod[cid] = cod;
@@ -224,15 +247,30 @@ void PollBluetooth(PollContext& ctx) {
     }
     SetupDiDestroyDeviceInfoList(di);
 
+    for (const auto& [cid, connected] : containerConn)
+        if (connected) battery.try_emplace(cid, Found{ -1, L"", true });
+
     // Physical devices a driver above already reported over a HID interface on the Bluetooth link
     // itself (e.g. Logitech HID++ names the LIFT "Logitech LIFT VERTICAL ERGONOMIC MOUSE" while
     // Bluetooth calls it "LIFT", so the name check below misses it).
     std::set<std::wstring> reported;
     std::map<std::wstring, std::pair<USHORT, USHORT>> hidIds;  // container id -> HID vid/pid on that device
+    std::map<std::uint32_t, std::uint64_t> hidLinks;
     for (const auto& c : ctx.colls) {
         std::wstring cont = HidContainer(c.path);
         hidIds[cont] = { c.vid, c.pid };
-        if (ctx.IsClaimed(c.vid, c.pid)) reported.insert(cont);
+        if (!ctx.IsClaimed(c.vid, c.pid)) continue;
+        reported.insert(cont);
+        auto device = containerDevice.find(cont);
+        if (device == containerDevice.end() || !device->second.address) continue;
+        const auto address = device->second.address;
+        auto [link, added] = hidLinks.emplace((std::uint32_t{c.vid} << 16) | c.pid, address);
+        if (!added && link->second != address) link->second = 0;  // ambiguous when models share a product id
+    }
+    for (auto& s : ctx.out) {
+        if (s.usbHid || s.bluetoothAddress || !s.hidProduct) continue;
+        auto link = hidLinks.find(s.hidProduct);
+        if (link != hidLinks.end()) s.bluetoothAddress = link->second;
     }
 
     for (auto& [cid, f] : battery) {
@@ -241,12 +279,14 @@ void PollBluetooth(PollContext& ctx) {
         if (mc != containerConn.end() ? !mc->second : !f.connected) continue;
         DeviceStatus s;
         s.key = L"bt:" + cid;
-        auto it = containerName.find(cid);
-        s.name = (it != containerName.end() && !it->second.empty()) ? it->second : f.name;
+        auto it = containerDevice.find(cid);
+        s.name = (it != containerDevice.end() && !it->second.name.empty()) ? it->second.name : f.name;
+        if (it != containerDevice.end()) s.bluetoothAddress = it->second.address;
         if (s.name.empty()) s.name = L"Bluetooth device";
         // Skip devices a vendor driver already reported over HID++ / Bragi on the same link.
         bool dup = false;
-        for (auto& o : ctx.out) dup |= o.name == s.name;
+        for (const auto& o : ctx.out)
+            dup |= o.name == s.name || (s.bluetoothAddress && o.bluetoothAddress == s.bluetoothAddress);
         if (dup) continue;
         s.via = L"Bluetooth";
         s.percent = f.pct;
@@ -261,6 +301,7 @@ void PollBluetooth(PollContext& ctx) {
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromBleIds(ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromCollections(ctx.colls, ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other) s.kind = GuessKind(s.name);
+        if (s.percent < 0 && s.kind == DeviceKind::Other) continue;
         ctx.out.push_back(s);
         ctx.btContainers.insert(cid);
     }
