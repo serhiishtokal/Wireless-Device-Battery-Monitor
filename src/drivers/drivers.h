@@ -2,6 +2,7 @@
 // Each driver looks at the enumerated HID collections, talks to the devices it recognises and
 // appends what it finds. A driver claims a device (vendor/product id) once it has handled it so
 // that the generic fallbacks further down the chain do not report it twice.
+#include <algorithm>
 #include <set>
 #include <utility>
 #include <vector>
@@ -19,6 +20,13 @@ struct PollContext {
     void Claim(USHORT vid, USHORT pid) { claimed.insert({ vid, pid }); }
     void Add(const DeviceStatus& s, USHORT vid, USHORT pid) {
         out.push_back(s);
+#ifdef _WIN32
+        const auto product = (std::uint32_t{vid} << 16) | pid;
+        out.back().hidProduct = product;
+        out.back().usbHid = std::any_of(colls.begin(), colls.end(), [=](const HidColl& c) {
+            return c.vid == vid && c.pid == pid && UsbHidProductId(c.path) == product;
+        });
+#endif
         Claim(vid, pid);
     }
     // Distinct (vid, pid) pairs for a vendor that are not claimed yet.
@@ -103,4 +111,5 @@ void PollMoondrop(PollContext& ctx);   // MOONDROP GM01 Pro headset (WalkPlay 2.
 void PollHeadsetControl(PollContext& ctx);  // only if headsetcontrol.exe is installed
 void PollGenericHid(PollContext& ctx);
 void PollBluetooth(PollContext& ctx);
+std::uint64_t BluetoothAddressFromInstance(const wchar_t* instanceId);
 void PollXInput(PollContext& ctx);

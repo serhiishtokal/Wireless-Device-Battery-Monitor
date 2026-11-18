@@ -11,21 +11,30 @@
 #include <cstring>
 #include <cwctype>
 
-std::vector<HidColl> EnumHid() {
+std::vector<HidColl> EnumHid(std::vector<std::uint32_t>* removedUsbProducts) {
     std::vector<HidColl> out;
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
     HDEVINFO di = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (di == INVALID_HANDLE_VALUE) return out;
+    if (di == INVALID_HANDLE_VALUE) {
+        if (removedUsbProducts) removedUsbProducts->clear();
+        return out;
+    }
+    bool complete = true;
     SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(di, nullptr, &hidGuid, i, &ifd); i++) {
         DWORD need = 0;
         SetupDiGetDeviceInterfaceDetailW(di, &ifd, nullptr, 0, &need, nullptr);
-        if (!need) continue;
+        if (!need) { complete = false; continue; }
         std::vector<BYTE> buf(need);
         auto det = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (!SetupDiGetDeviceInterfaceDetailW(di, &ifd, det, need, nullptr, nullptr)) continue;
+        if (!SetupDiGetDeviceInterfaceDetailW(di, &ifd, det, need, nullptr, nullptr)) { complete = false; continue; }
+        if (removedUsbProducts && !removedUsbProducts->empty()) {
+            const auto present = UsbHidProductId(det->DevicePath);
+            auto& pending = *removedUsbProducts;
+            pending.erase(std::remove(pending.begin(), pending.end(), present), pending.end());
+        }
         HANDLE h = CreateFileW(det->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) continue;
         HidColl c;
@@ -41,6 +50,7 @@ std::vector<HidColl> EnumHid() {
         if (mi != std::wstring::npos) c.iface = (int)wcstol(lower.c_str() + mi + 4, nullptr, 16);
         out.push_back(std::move(c));
     }
+    if (removedUsbProducts && (!complete || GetLastError() != ERROR_NO_MORE_ITEMS)) removedUsbProducts->clear();
     SetupDiDestroyDeviceInfoList(di);
     return out;
 }

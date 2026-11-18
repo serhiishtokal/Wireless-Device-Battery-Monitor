@@ -23,6 +23,8 @@ struct HIDP_CAPS {
 
 #include <initializer_list>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "devices.h"
@@ -40,7 +42,30 @@ struct HidColl {
     USHORT featLen() const { return caps.FeatureReportByteLength; }
 };
 
+#ifdef _WIN32
+std::vector<HidColl> EnumHid(std::vector<std::uint32_t>* removedUsbProducts = nullptr);
+std::vector<std::pair<USHORT, USHORT>> IgnoredHidDevices();
+
+inline std::uint32_t UsbHidProductId(std::wstring_view path) {
+    constexpr std::wstring_view prefix = LR"(\\?\hid#vid_)";
+    if (path.size() < prefix.size() + 14 || _wcsnicmp(path.data(), prefix.data(), prefix.size()) ||
+        _wcsnicmp(path.data() + prefix.size() + 4, L"&pid_", 5)) return 0;
+    const auto ids = path.substr(prefix.size());
+    if (ids[13] != L'&' && ids[13] != L'#') return 0;
+    constexpr std::wstring_view hex = L"0123456789abcdefABCDEF";
+    std::uint32_t packed = 0;
+    for (auto group : { ids.substr(0, 4), ids.substr(9, 4) }) {
+        for (auto c : group) {
+            const auto digit = hex.find(c);
+            if (digit == hex.npos) return 0;
+            packed = packed * 16 + static_cast<std::uint32_t>(digit < 16 ? digit : digit - 6);
+        }
+    }
+    return packed;
+}
+#else
 std::vector<HidColl> EnumHid();
+#endif
 
 class HidDev {
 public:

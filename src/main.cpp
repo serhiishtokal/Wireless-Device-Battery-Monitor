@@ -4,16 +4,24 @@
 #include <dbt.h>
 #include <initguid.h>
 #include <hidclass.h>
+#include <bthdef.h>
+#include <bluetoothapis.h>
 
 #include <algorithm>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "connection_refresh.h"
 #include "devices.h"
+#include "drivers/razer_link.h"
+#include "hid.h"
 #include "report.h"
 #include "widget.h"
 
@@ -27,6 +35,7 @@ constexpr UINT_PTR TIMER_WIDGET = 2;
 constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
 constexpr int LOW_BATTERY = 15;
 constexpr UINT PLACEHOLDER_ID = 1;
+constexpr wchar_t kPendingBatteryText[] = L"??%";
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
@@ -44,6 +53,17 @@ const wchar_t* kSettingsKey = L"Software\\WirelessBattery";
 HINSTANCE g_inst;
 HWND g_hwnd;
 HANDLE g_refreshEvt, g_stopEvt, g_worker;
+std::map<HDEVNOTIFY, HANDLE> g_bluetoothRadios;
+SRWLOCK g_connectionChangesLock = SRWLOCK_INIT;
+struct LinkChange { std::wstring key; ULONGLONG changedAt; bool connected; };
+std::vector<LinkChange> g_connectionChanges;
+std::vector<std::uint32_t> g_usbRemovalCandidates;
+std::uint64_t g_changeSequence = 0;
+std::uint64_t g_usbSequence = 0;
+struct RecentLink { ULONGLONG changedAt; std::uint64_t sequence; bool connected; };
+std::map<std::wstring, RecentLink> g_recentLinks;
+RazerLinkWatch g_razerLink;
+bool g_reopenRazer = false;
 UINT g_taskbarCreatedMsg;
 bool g_lightTaskbar;
 bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
@@ -143,7 +163,12 @@ void SaveOrder() {
 }
 
 bool IsEntryHidden(const TrayEntry& e) {
-    return IsHidden(e.st.key) || (g_hideLastKnown && (e.st.asleep || (e.st.percent < 0 && e.lastPct >= 0)));
+    return IsHidden(e.st.key) ||
+           (g_hideLastKnown && !BatteryReadingPending(e.st) && (e.st.asleep || (e.st.percent < 0 && e.lastPct >= 0)));
+}
+
+int DisplayedPercent(const TrayEntry& e) {
+    return e.st.percent >= 0 || BatteryReadingPending(e.st) ? e.st.percent : e.lastPct;
 }
 
 bool LoadBoolSetting(const wchar_t* name, bool defaultVal) {
@@ -298,14 +323,14 @@ HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barCol
 
 Rgb Foreground() { return g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }; }
 
-HICON IconFor(int pct, bool charging, bool dim) {
+HICON IconFor(int pct, bool charging, bool dim, bool pending) {
     Rgb fg = Foreground();
     Rgb bar = charging        ? Rgb{ 0, 170, 255 }
             : pct <= LOW_BATTERY ? Rgb{ 232, 32, 48 }
             : pct <= 30       ? Rgb{ 255, 150, 0 }
                               : Rgb{ 30, 190, 90 };
     Rgb text = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 } : fg;
-    std::wstring t = pct < 0 ? L"?" : std::to_wstring(pct);
+    std::wstring t = pct >= 0 ? std::to_wstring(pct) : pending ? kPendingBatteryText : L"?";
     return RenderIcon(t, pct, text, bar, dim);
 }
 
@@ -319,6 +344,7 @@ void CopyTip(wchar_t* dst, size_t cap, const std::wstring& s) {
 std::wstring StatusText(const TrayEntry& e) {
     const auto& s = e.st;
     if (!s.connected) return L"off / not connected";
+    if (BatteryReadingPending(s)) return kPendingBatteryText;
     std::wstring t;
     if (!s.levelText.empty() && s.percent >= 0) t = s.levelText;
     else if (s.percent >= 0) t = std::to_wstring(s.percent) + L"%";
@@ -383,12 +409,14 @@ void ApplyEntry(TrayEntry& e) {
         if (e.added) { TrayDelete(e.uid); e.added = false; }
         return;
     }
-    int shown = s.percent >= 0 ? s.percent : e.lastPct;
-    bool dim = s.percent < 0;
-    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k");
+    const bool pending = BatteryReadingPending(s);
+    int shown = DisplayedPercent(e);
+    bool dim = s.percent < 0 && !pending;
+    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (pending ? L"?" : dim ? L"d" : L"") +
+                       (g_lightTaskbar ? L"l" : L"k");
     if (sig != e.iconSig || !e.icon) {
         if (e.icon) DestroyIcon(e.icon);
-        e.icon = IconFor(shown, s.charging, dim);
+        e.icon = IconFor(shown, s.charging, dim, pending);
         e.iconSig = sig;
     }
     std::wstring tip = s.name + L"\n" + StatusText(e);
@@ -446,10 +474,12 @@ void UpdateWidget() {
     for (auto* e : list) {
         WidgetItem it;
         it.kind = e->st.kind;
-        it.percent = e->st.percent >= 0 ? e->st.percent : e->lastPct;
-        if (e->st.percent >= 0) it.text = e->st.levelText;
+        const bool pending = BatteryReadingPending(e->st);
+        it.percent = DisplayedPercent(*e);
+        if (pending) it.text = kPendingBatteryText;
+        else if (e->st.percent >= 0) it.text = e->st.levelText;
         it.charging = e->st.charging;
-        it.dim = e->st.percent < 0;
+        it.dim = e->st.percent < 0 && !pending;
         it.low = !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
         it.bluetooth = e->st.via == L"Bluetooth";
         items.push_back(it);
@@ -460,9 +490,25 @@ void UpdateWidget() {
     widget::SetItems(items, tip);
 }
 
-void OnResults(std::vector<DeviceStatus>& results) {
+struct PollResult {
+    ULONGLONG started;
+    std::uint64_t sequence;
+    std::vector<std::uint32_t> removedUsbProducts;
+    std::vector<DeviceStatus> devices;
+};
+
+void OnResults(const PollResult& result) {
+    for (auto it = g_recentLinks.begin(); it != g_recentLinks.end();) {
+        if (result.started >= it->second.changedAt + kLastConnectionRetryMs) it = g_recentLinks.erase(it);
+        else ++it;
+    }
     std::map<std::wstring, bool> seen;
-    for (auto& s : results) {
+    for (const auto& s : result.devices) {
+        if (!g_recentLinks.empty()) {
+            auto link = g_recentLinks.find(ConnectionKey(s));
+            if (link != g_recentLinks.end() &&
+                (result.sequence < link->second.sequence || !link->second.connected || !s.connected)) continue;
+        }
         auto& e = g_entries[s.key];
         if (!e.uid) e.uid = StableId(s.key);
         e.st = s;
@@ -473,12 +519,20 @@ void OnResults(std::vector<DeviceStatus>& results) {
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
         auto& e = it->second;
+        const bool removed = !seen.count(it->first) && e.st.usbHid && result.sequence >= g_usbSequence &&
+            std::find(result.removedUsbProducts.begin(), result.removedUsbProducts.end(), e.st.hidProduct) !=
+                result.removedUsbProducts.end();
+        if (!removed && e.st.connected && !g_recentLinks.empty() && g_recentLinks.count(ConnectionKey(e.st))) {
+            ++it;
+            continue;
+        }
         // Some receivers drop sleeping devices from the link; keep showing the last value for a while.
-        bool inGrace = !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
+        bool inGrace = !removed && !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
                        GetTickCount64() - e.lastSeen < (ULONGLONG)e.st.graceSec * 1000;
         if (inGrace) {
+            const bool pending = BatteryReadingPending(e.st);
             e.st.percent = -1;
-            e.st.asleep = true;
+            e.st.asleep = !pending;
             ApplyEntry(e);
         }
         if (!seen.count(it->first) && !inGrace) {
@@ -665,15 +719,176 @@ void ShowMenu() {
 // ---- worker thread ----------------------------------------------------------------------------
 
 DWORD WINAPI Worker(LPVOID) {
+    ConnectionRefresh refresh;
+    std::vector<LinkChange> changes;
     for (;;) {
-        auto* v = new std::vector<DeviceStatus>(PollAllDevices());
-        if (!PostMessageW(g_hwnd, WM_RESULTS, 0, (LPARAM)v)) delete v;
+        auto* result = new PollResult{};
+        AcquireSRWLockExclusive(&g_connectionChangesLock);
+        changes.swap(g_connectionChanges);
+        result->removedUsbProducts.swap(g_usbRemovalCandidates);
+        result->sequence = g_changeSequence;
+        result->started = GetTickCount64();
+        ReleaseSRWLockExclusive(&g_connectionChangesLock);
+        for (const auto& [key, changedAt, connected] : changes) refresh.ConnectionChanged(key, connected, changedAt);
+        changes.clear();
+
+        result->devices = PollAllDevices(&result->removedUsbProducts);
+        const DWORD wait = refresh.NextWait(result->devices, result->started, GetTickCount64(), POLL_INTERVAL_MS);
+        if (!PostMessageW(g_hwnd, WM_RESULTS, 0, (LPARAM)result)) delete result;
         HANDLE hs[2] = { g_stopEvt, g_refreshEvt };
-        if (WaitForMultipleObjects(2, hs, FALSE, POLL_INTERVAL_MS) == WAIT_OBJECT_0) return 0;
+        if (WaitForMultipleObjects(2, hs, FALSE, wait) == WAIT_OBJECT_0) return 0;
     }
 }
 
 void RefreshSoon(UINT ms) { SetTimer(g_hwnd, TIMER_DEBOUNCE, ms, nullptr); }
+
+void OnLinkChanged(const std::wstring& key, bool connected, const DeviceStatus* initial = nullptr) {
+    const auto now = GetTickCount64();
+    const auto previous = g_recentLinks.find(key);
+    if (previous != g_recentLinks.end() && previous->second.connected == connected &&
+        now - previous->second.changedAt < kLastConnectionRetryMs) return;
+    AcquireSRWLockExclusive(&g_connectionChangesLock);
+    const auto sequence = ++g_changeSequence;
+    g_connectionChanges.push_back({ key, now, connected });
+    ReleaseSRWLockExclusive(&g_connectionChangesLock);
+    g_recentLinks[key] = { now, sequence, connected };
+    bool redraw = false;
+    if (connected && initial && !g_entries.count(initial->key) &&
+        std::none_of(g_entries.begin(), g_entries.end(), [&](const auto& item) {
+            return item.second.st.connected && item.second.st.name == initial->name;
+        })) {
+        auto& entry = g_entries[initial->key];
+        entry.st = *initial;
+        entry.uid = StableId(initial->key);
+        entry.lastSeen = now;
+        ApplyEntry(entry);
+        redraw = true;
+    }
+    for (auto& [entryKey, entry] : g_entries) {
+        if (entry.st.connected == connected || ConnectionKey(entry.st) != key) continue;
+        entry.st.connected = connected;
+        if (connected) {
+            entry.st.percent = -1;
+            entry.st.levelText.clear();
+            entry.st.asleep = false;
+            entry.st.charging = false;
+            entry.lastSeen = now;
+        }
+        ApplyEntry(entry);
+        redraw = true;
+    }
+    if (redraw) {
+        UpdatePlaceholder();
+        UpdateWidget();
+    }
+    SetEvent(g_refreshEvt);
+}
+
+void OnHidDeviceChange(WPARAM event, LPARAM data) {
+    if (!data || (event != DBT_DEVICEARRIVAL && event != DBT_DEVICEREMOVECOMPLETE)) return;
+    const auto* header = reinterpret_cast<const DEV_BROADCAST_HDR*>(data);
+    constexpr auto offset = offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name);
+    if (header->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE || header->dbch_size < offset + sizeof(wchar_t)) return;
+    const auto* change = reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(data);
+    if (!IsEqualGUID(change->dbcc_classguid, GUID_DEVINTERFACE_HID)) return;
+    const auto* end = std::wmemchr(change->dbcc_name, 0, (header->dbch_size - offset) / sizeof(wchar_t));
+    if (!end) return;
+    const auto product = UsbHidProductId({ change->dbcc_name, static_cast<size_t>(end - change->dbcc_name) });
+    if (!product) return;
+    AcquireSRWLockExclusive(&g_connectionChangesLock);
+    g_usbSequence = ++g_changeSequence;
+    if (event == DBT_DEVICEREMOVECOMPLETE &&
+        std::find(g_usbRemovalCandidates.begin(), g_usbRemovalCandidates.end(), product) == g_usbRemovalCandidates.end())
+        g_usbRemovalCandidates.push_back(product);
+    ReleaseSRWLockExclusive(&g_connectionChangesLock);
+    if (product == ((kBasiliskReceiverVid << 16) | kBasiliskReceiverPid)) g_reopenRazer = true;
+}
+
+void ReadRazerLink() {
+    const auto change = g_razerLink.Read();
+    if (change == RazerLinkChange::None) return;
+    DeviceStatus device;
+    device.key = L"razer:" + Hex4(kBasiliskReceiverPid);
+    device.name = L"Razer Basilisk V3 Pro";
+    device.via = L"Razer receiver";
+    device.kind = DeviceKind::Mouse;
+    device.graceSec = 120;
+    device.hidProduct = (kBasiliskReceiverVid << 16) | kBasiliskReceiverPid;
+    device.usbHid = true;
+    OnLinkChanged(device.key, change == RazerLinkChange::Connected, &device);
+}
+
+void UnregisterBluetoothRadios() {
+    for (const auto& [notification, radio] : g_bluetoothRadios) {
+        UnregisterDeviceNotification(notification);
+        if (radio) CloseHandle(radio);
+    }
+    g_bluetoothRadios.clear();
+}
+
+void RegisterBluetoothRadios() {
+    UnregisterBluetoothRadios();
+    BLUETOOTH_FIND_RADIO_PARAMS params{ sizeof(params) };
+    HANDLE radio;
+    HBLUETOOTH_RADIO_FIND radios = BluetoothFindFirstRadio(&params, &radio);
+    if (!radios) return;  // the minute scan still works without a radio notification
+    do {
+        DEV_BROADCAST_HANDLE filter{};
+        filter.dbch_size = sizeof(filter);
+        filter.dbch_devicetype = DBT_DEVTYP_HANDLE;
+        filter.dbch_handle = radio;
+        auto notification = RegisterDeviceNotificationW(g_hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+        if (notification) g_bluetoothRadios.emplace(notification, radio);
+        else CloseHandle(radio);
+    } while (BluetoothFindNextRadio(radios, &radio));
+    BluetoothFindRadioClose(radios);
+}
+
+void OnBluetoothDeviceChange(WPARAM event, LPARAM data) {
+    if (!data) return;
+    const auto* header = reinterpret_cast<const DEV_BROADCAST_HDR*>(data);
+    if (header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE &&
+        (event == DBT_DEVICEARRIVAL || event == DBT_DEVICEREMOVECOMPLETE) &&
+        header->dbch_size >= offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) {
+        const auto* device = reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(data);
+        if (IsEqualGUID(device->dbcc_classguid, GUID_BTHPORT_DEVICE_INTERFACE)) RegisterBluetoothRadios();
+        return;
+    }
+    if (header->dbch_devicetype != DBT_DEVTYP_HANDLE ||
+        header->dbch_size < offsetof(DEV_BROADCAST_HANDLE, dbch_eventguid)) return;
+    const auto* change = reinterpret_cast<const DEV_BROADCAST_HANDLE*>(data);
+    auto radio = g_bluetoothRadios.find(change->dbch_hdevnotify);
+    if (radio == g_bluetoothRadios.end()) return;
+    if (event == DBT_DEVICEQUERYREMOVE || event == DBT_DEVICEREMOVEPENDING || event == DBT_DEVICEREMOVECOMPLETE) {
+        if (radio->second) CloseHandle(radio->second);
+        radio->second = nullptr;
+        if (event == DBT_DEVICEREMOVECOMPLETE) {
+            UnregisterDeviceNotification(radio->first);
+            g_bluetoothRadios.erase(radio);
+        }
+        return;
+    }
+    if (event == DBT_DEVICEQUERYREMOVEFAILED) {
+        RegisterBluetoothRadios();
+        return;
+    }
+    constexpr size_t size = offsetof(BTH_RADIO_IN_RANGE, previousDeviceFlags) + sizeof(ULONG);
+    if (event != DBT_CUSTOMEVENT || !radio->second ||
+        change->dbch_size < offsetof(DEV_BROADCAST_HANDLE, dbch_data) + size ||
+        !IsEqualGUID(change->dbch_eventguid, GUID_BLUETOOTH_RADIO_IN_RANGE)) return;
+
+    BTH_RADIO_IN_RANGE remote{};
+    std::memcpy(&remote, change->dbch_data, size);
+    const auto& device = remote.deviceInfo;
+    constexpr ULONG connectedFlags = BDIF_CONNECTED | BDIF_LE_CONNECTED;
+    const ULONG links = device.flags & connectedFlags;
+    const ULONG previousLinks = remote.previousDeviceFlags & connectedFlags;
+    // Audio can connect over Bluetooth Classic while the headset already has a BLE link.
+    const bool connected = (links & ~previousLinks) != 0;
+    const bool disconnected = links == 0 && previousLinks != 0;
+    if ((!connected && !disconnected) || !(device.flags & BDIF_ADDRESS) || !device.address) return;
+    OnLinkChanged(BluetoothConnectionKey(device.address), connected);
+}
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_taskbarCreatedMsg && msg != 0) {  // Explorer restarted
@@ -685,9 +900,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
         case WM_RESULTS: {
-            auto* v = reinterpret_cast<std::vector<DeviceStatus>*>(lp);
-            OnResults(*v);
-            delete v;
+            auto* result = reinterpret_cast<PollResult*>(lp);
+            OnResults(*result);
+            delete result;
             return 0;
         }
         case WM_TRAY:
@@ -704,13 +919,23 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp) DestroyWindow(h);
             return 0;
         case WM_DEVICECHANGE:
-            if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) RefreshSoon(2500);
+            OnBluetoothDeviceChange(wp, lp);
+            g_razerLink.DeviceChange(h, wp, lp);
+            OnHidDeviceChange(wp, lp);
+            if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) RefreshSoon(200);
             return TRUE;
         case WM_POWERBROADCAST:
             if (wp == PBT_APMRESUMEAUTOMATIC) RefreshSoon(5000);
             return TRUE;
         case WM_TIMER:
-            if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
+            if (wp == TIMER_DEBOUNCE) {
+                KillTimer(h, TIMER_DEBOUNCE);
+                if (g_reopenRazer) {
+                    g_reopenRazer = false;
+                    g_razerLink.Open(h);
+                }
+                SetEvent(g_refreshEvt);
+            }
             if (wp == TIMER_WIDGET) Reconcile();
             return 0;
         case WM_SETTINGCHANGE:
@@ -721,6 +946,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY:
             KillTimer(h, TIMER_WIDGET);
+            g_razerLink.Close();
             widget::Destroy();
             SetEvent(g_stopEvt);
             if (g_worker) WaitForSingleObject(g_worker, 5000);
@@ -838,6 +1064,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
 
     g_refreshEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_stopEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    filter.dbcc_classguid = GUID_BTHPORT_DEVICE_INTERFACE;
+    HDEVNOTIFY bluetoothNotify = RegisterDeviceNotificationW(g_hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    RegisterBluetoothRadios();
+    g_razerLink.Open(g_hwnd);
     g_wantWidget = LoadWidgetMode();
     g_hideLastKnown = LoadHideLastKnown();
     g_widgetBackground = LoadWidgetBackground();
@@ -851,15 +1081,24 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
 
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        if (report::PreTranslate(&m)) continue;
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
+    MSG m{};
+    while (m.message != WM_QUIT) {
+        const HANDLE ready = g_razerLink.ReadyEvent();
+        const DWORD wait = MsgWaitForMultipleObjectsEx(ready ? 1 : 0, ready ? &ready : nullptr,
+                                                       INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait == WAIT_FAILED) break;
+        if (ready && wait == WAIT_OBJECT_0) ReadRazerLink();
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) && m.message != WM_QUIT) {
+            if (report::PreTranslate(&m)) continue;
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
     }
     // drain results posted after shutdown started
-    while (PeekMessageW(&m, nullptr, WM_RESULTS, WM_RESULTS, PM_REMOVE)) delete reinterpret_cast<std::vector<DeviceStatus>*>(m.lParam);
+    while (PeekMessageW(&m, nullptr, WM_RESULTS, WM_RESULTS, PM_REMOVE)) delete reinterpret_cast<PollResult*>(m.lParam);
     if (notify) UnregisterDeviceNotification(notify);
+    if (bluetoothNotify) UnregisterDeviceNotification(bluetoothNotify);
+    UnregisterBluetoothRadios();
     if (g_worker) CloseHandle(g_worker);
     ReleaseMutex(mutex);
     return 0;

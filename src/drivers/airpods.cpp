@@ -301,6 +301,7 @@ const DEVPROPKEY kIsConnected = { { 0x83DA6326, 0x97A6, 0x4088, { 0x94, 0x53, 0x
 
 struct AppleDevice {
     std::wstring name;
+    std::uint64_t bluetoothAddress = 0;
     UINT16 pid = 0;          // Apple model id, from the "_VID&0001004C_PID&xxxx" service nodes
     bool connected = false;
     bool apple = false;
@@ -333,6 +334,7 @@ std::vector<AppleDevice> PairedAppleAudio() {
             if (p != std::wstring::npos) d.pid = (UINT16)wcstoul(id.c_str() + p + 5, nullptr, 16);
         }
         if (!wcsncmp(inst, L"BTHENUM\\DEV_", 12)) {
+            d.bluetoothAddress = BluetoothAddressFromInstance(inst);
             wchar_t buf[256] = {};
             if (SetupDiGetDevicePropertyW(di, &dd, &DEVPKEY_Device_FriendlyName, &t, (PBYTE)buf, sizeof(buf) - sizeof(wchar_t), nullptr, 0))
                 d.name = buf;
@@ -419,6 +421,7 @@ void PollAirPods(PollContext& ctx) {
         s.name = d.name.empty() ? L"AirPods" : d.name;
         s.key = L"airpods:" + Hex4(d.pid) + L":" + s.name;
         s.kind = DeviceKind::Headset;
+        s.bluetoothAddress = d.bluetoothAddress;
         if (a.single) {
             s.percent = a.left;
             s.charging = a.leftChg;
